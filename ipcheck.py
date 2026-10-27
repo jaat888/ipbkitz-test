@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """Run in Termux:   python3 ipcheck.py https://YOUR-APP.blitz.cloud
 Optional:          python3 ipcheck.py https://YOUR-APP.blitz.cloud 1.2.3.4   (your real public IP)
-Standard library only.  Sends normal + fake-header requests and tells which IP
-header/position of the hosting proxy can be trusted."""
+Standard library only.  Sends a normal request, then ONE fake header at a time,
+and tells which IP header of the hosting proxy can be trusted."""
 import json
 import sys
+import urllib.error
 import urllib.request
 
 FAKE = "9.9.9.9"
+HEADERS = ["X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP", "True-Client-IP"]
 
 
 def get(url, headers=None):
+    """-> (http_status, data_or_None). Never raises for HTTP errors."""
     req = urllib.request.Request(url, headers=dict({"User-Agent": "ipcheck/1"}, **(headers or {})))
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except Exception as e:
+        print("   network error:", e)
+        return 0, None
 
 
 def my_public_ip():
@@ -28,13 +37,9 @@ def my_public_ip():
     return ""
 
 
-def show(title, d):
-    print("\n--- %s" % title)
-    print("  socket peer :", d["socket_peer"])
-    print("  XFF list    :", d["xff_list"] or "(none)")
-    for k, v in d["ip_related_headers"].items():
-        if k != "x-forwarded-for":
-            print("  %-12s:" % k, " | ".join(v))
+def val(d, h):
+    v = d["ip_related_headers"].get(h.lower())
+    return v[0] if v else None
 
 
 def main():
@@ -45,55 +50,39 @@ def main():
     me = sys.argv[2] if len(sys.argv) > 2 else my_public_ip()
     print("your public IP (from ipify):", me or "UNKNOWN (pass it as 2nd argument)")
 
-    base_d = get(base + "/json?tag=termux-normal")
-    show("1. normal request", base_d)
-    spoof = {
-        "X-Forwarded-For": FAKE,
-        "X-Real-IP": FAKE,
-        "CF-Connecting-IP": FAKE,
-        "True-Client-IP": FAKE,
-    }
-    sp = get(base + "/json?tag=termux-spoof", spoof)
-    show("2. request WITH fake headers (%s)" % FAKE, sp)
+    st, d0 = get(base + "/json?tag=termux-normal")
+    if not d0:
+        print("normal request failed, HTTP", st)
+        return
+    print("\n--- 1. normal request (HTTP %s)" % st)
+    print("  socket peer :", d0["socket_peer"], "(proxy/internal address)")
+    print("  XFF list    :", d0["xff_list"] or "(none)")
+    for h in HEADERS[1:]:
+        print("  %-17s:" % h, val(d0, h))
+
+    print("\n--- 2. fake IP %s, one header at a time" % FAKE)
+    safe = []
+    for h in HEADERS:
+        st, d = get(base + "/json?tag=termux-fake-" + h.lower(), {h: FAKE})
+        if d is None:
+            print("  %-17s -> BLOCKED by the platform (HTTP %s)  [good: fake never reaches the app]" % (h, st))
+            continue
+        lst = d["xff_list"] if h == "X-Forwarded-For" else [val(d, h)]
+        if FAKE in lst:
+            pos = "FIRST" if lst[0] == FAKE else ("LAST" if lst[-1] == FAKE else "MIDDLE")
+            print("  %-17s -> fake PASSED THROUGH (%s of %d)  list=%s" % (h, pos, len(lst), lst))
+            if h == "X-Forwarded-For" and lst[-1] != FAKE and me and lst[-1] == me:
+                safe.append("X-Forwarded-For: use the LAST entry (proxy appends the real IP)")
+        else:
+            print("  %-17s -> fake removed/overwritten, app sees %s" % (h, lst))
+            if me and (val(d0, h) == me or (h == "X-Forwarded-For" and d0["xff_list"][:1] == [me])):
+                safe.append(h)
 
     print("\n================ RESULT ================")
-    l1, l2 = base_d["xff_list"], sp["xff_list"]
-    rec = None
     if me:
-        if me in l1:
-            pos1 = "FIRST" if l1[0] == me else ("LAST" if l1[-1] == me else "MIDDLE")
-            print("normal: your IP is in X-Forwarded-For (%s of %d)" % (pos1, len(l1)))
-        else:
-            print("normal: your IP is NOT in X-Forwarded-For")
-        for h in ("x-real-ip", "cf-connecting-ip", "true-client-ip"):
-            v = base_d["ip_related_headers"].get(h)
-            if v:
-                print("normal: %s = %s %s" % (h, v[0], "(= your IP)" if v[0] == me else "(not your IP)"))
-        print("normal: socket peer = %s %s" % (base_d["socket_peer"],
-              "(= your IP, no proxy hides it)" if base_d["socket_peer"] == me else "(proxy address)"))
-    fake_in = FAKE in l2
-    fake_pos = None
-    if fake_in:
-        fake_pos = "FIRST" if l2[0] == FAKE else ("LAST" if l2[-1] == FAKE else "MIDDLE")
-    print("spoof : fake IP in X-Forwarded-For: %s" % ("YES (%s of %d)" % (fake_pos, len(l2)) if fake_in else "NO (proxy removed/overwrote it)"))
-    for h in ("x-real-ip", "cf-connecting-ip", "true-client-ip"):
-        v = sp["ip_related_headers"].get(h)
-        if v:
-            print("spoof : %s = %s %s" % (h, v[0], "<- FAKE passed through, do NOT trust" if v[0] == FAKE else "<- real (proxy overwrote the fake)"))
-
-    if me:
-        if fake_in and l2[-1] != FAKE and me in l2:
-            rec = "TRUST the LAST entry of X-Forwarded-For (proxy appends; the first one is client-controlled)."
-        elif not fake_in and me in l2:
-            rec = "X-Forwarded-For is safe: proxy overwrites it. Use the first entry."
-        elif fake_in and l2[-1] == FAKE:
-            rec = "UNSAFE: fake IP is last in X-Forwarded-For. Look at the other headers/socket peer."
-        for h in ("x-real-ip", "cf-connecting-ip", "true-client-ip"):
-            v1 = base_d["ip_related_headers"].get(h)
-            v2 = sp["ip_related_headers"].get(h)
-            if v1 and v1[0] == me and v2 and v2[0] != FAKE:
-                rec = (rec + "\n" if rec else "") + "ALSO SAFE: header %s (real IP, fake overwritten)." % h
-    print("\nRECOMMENDATION:", rec or "could not decide - send me the output above (and the /log page).")
+        print("normal request: " + ", ".join("%s=%s" % (h, "OK" if (val(d0, h) == me) else val(d0, h))
+                                               for h in HEADERS[1:]))
+    print("SAFE TO TRUST:", ", ".join(safe) if safe else "none found - send me this whole output")
 
 
 if __name__ == "__main__":
